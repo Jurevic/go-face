@@ -44,18 +44,20 @@ static const size_t DESCR_SIZE = DESCR_LEN * sizeof(float);
 
 class FaceRec {
 public:
-	FaceRec(const char* model_dir) {
+	FaceRec(const char* model_dir, const double threshold, const unsigned int jitter) {
+	    threshold_ = threshold;
+	    jitter_ = jitter;
+
 		detector_ = get_frontal_face_detector();
 
 		std::string dir = model_dir;
-		std::string shape_predictor_path = dir + "/shape_predictor_5_face_landmarks.dat";
+		std::string shape_predictor_path = dir + "/shape_predictor_68_face_landmarks.dat";
 		std::string resnet_path = dir + "/dlib_face_recognition_resnet_model_v1.dat";
 
 		deserialize(shape_predictor_path) >> sp_;
 		deserialize(resnet_path) >> net_;
 	}
 
-	// TODO(Kagami): Jittering?
 	std::pair<std::vector<rectangle>, std::vector<descriptor>>
 	Recognize(const matrix<rgb_pixel>& img, int max_faces) {
 		std::vector<rectangle> rects = detector_(img);
@@ -66,41 +68,69 @@ public:
 			return {std::move(rects), std::move(descrs)};
 
 		std::vector<matrix<rgb_pixel>> face_imgs;
+		thread_local dlib::rand rnd;
 		for (const auto& rect : rects) {
 			auto shape = sp_(img, rect);
 			matrix<rgb_pixel> face_chip;
 			extract_image_chip(img, get_face_chip_details(shape, 150, 0.25), face_chip);
+
 			face_imgs.push_back(std::move(face_chip));
 		}
 
-		descrs = net_(face_imgs);
+        if (jitter_ == 0) {
+		    descrs = net_(face_imgs);
+		} else {
+		    // Jittering
+		    std::vector<matrix<rgb_pixel>> crops;
+		    for (unsigned int i = 0; i < face_imgs.size(); i++) {
+		        crops.clear();
+                for (unsigned int j = 0; j < jitter_; j++) {
+		            crops.push_back(jitter_image(face_imgs[i], rnd));
+		        }
+		        descrs.push_back(mean(mat(net_(crops))));
+		    }
+		}
+
 		return {std::move(rects), std::move(descrs)};
 	}
 
-	void SetSamples(std::vector<sample_type> samples, std::unordered_map<int, int> cats) {
+	void SetSamples(std::vector<sample_type> samples) {
 		samples_ = std::move(samples);
-		cats_ = std::move(cats);
 	}
 
 	int Classify(const sample_type& test_sample) {
-		if (samples_.size() == 0)
-			return -1;
-		return classify(samples_, cats_, test_sample);
+	    if (samples_.size() == 0)
+	        return -1;
+
+        double min_distance = threshold_;
+        int min_label = -1;
+        int i = 0;
+        for (const auto& sample : samples_) {
+            auto dist = length(sample - test_sample);
+            if (dist < min_distance) {
+                min_distance = dist;
+                min_label = i;
+            }
+            i++;
+        }
+        return min_label;
 	}
+
 private:
 	std::vector<sample_type> samples_;
-	std::unordered_map<int, int> cats_;
 	frontal_face_detector detector_;
 	shape_predictor sp_;
 	anet_type net_;
+	double threshold_;
+	unsigned int jitter_;
 };
 
 // Plain C interface for Go.
 
-facerec* facerec_init(const char* model_dir) {
+facerec* facerec_init(const char* model_dir, const double threshold, const unsigned int jitter) {
 	facerec* rec = (facerec*)calloc(1, sizeof(facerec));
 	try {
-		FaceRec* cls = new FaceRec(model_dir);
+		FaceRec* cls = new FaceRec(model_dir, threshold, jitter);
 		rec->cls = (void*)cls;
 	} catch(serialization_error& e) {
 		rec->err_str = strdup(e.what());
@@ -117,7 +147,6 @@ faceret* facerec_recognize(facerec* rec, const uint8_t* img_data, int len, int m
 	FaceRec* cls = (FaceRec*)(rec->cls);
 	matrix<rgb_pixel> img;
 	try {
-		// TODO(Kagami): Support more file types?
 		load_mem_jpeg(img, img_data, len);
 		auto [rects, descrs] = cls->Recognize(img, max_faces);
 		ret->num_faces = descrs.size();
@@ -147,12 +176,42 @@ faceret* facerec_recognize(facerec* rec, const uint8_t* img_data, int len, int m
 	return ret;
 }
 
-void facerec_set_samples(
-	facerec* rec,
-	const float* descriptors,
-	const int32_t* cats,
-	int len
-) {
+faceret* facerec_recognize_mat(facerec* rec, const uint8_t* img_data, int rows, int columns, int max_faces) {
+    faceret* ret = (faceret*)calloc(1, sizeof(faceret));
+    FaceRec* cls = (FaceRec*)(rec->cls);
+    matrix<rgb_pixel> img;
+    try {
+        load_bytes_arr(img, img_data, rows, columns);
+        auto [rects, descrs] = cls->Recognize(img, max_faces);
+        ret->num_faces = descrs.size();
+        if (ret->num_faces == 0)
+            return ret;
+        ret->rectangles = (long*)malloc(ret->num_faces * RECT_SIZE);
+        for (int i = 0; i < ret->num_faces; i++) {
+            long* dst = ret->rectangles + i * 4;
+            dst[0] = rects[i].left();
+            dst[1] = rects[i].top();
+            dst[2] = rects[i].right();
+            dst[3] = rects[i].bottom();
+        }
+        ret->descriptors = (float*)malloc(ret->num_faces * DESCR_SIZE);
+        for (int i = 0; i < ret->num_faces; i++) {
+            void* dst = (uint8_t*)(ret->descriptors) + i * DESCR_SIZE;
+            void* src = (void*)&descrs[i](0,0);
+            memcpy(dst, src, DESCR_SIZE);
+        }
+    } catch(image_load_error& e) {
+        ret->err_str = strdup(e.what());
+        ret->err_code = IMAGE_LOAD_ERROR;
+    } catch (std::exception& e) {
+        ret->err_str = strdup(e.what());
+        ret->err_code = UNKNOWN_ERROR;
+    }
+    return ret;
+}
+
+
+void facerec_set_samples(facerec* rec, const float* descriptors, int len) {
 	FaceRec* cls = (FaceRec*)(rec->cls);
 	std::vector<sample_type> samples;
 	samples.reserve(len);
@@ -160,14 +219,7 @@ void facerec_set_samples(
 		sample_type sample = mat(descriptors + i*DESCR_LEN, DESCR_LEN, 1);
 		samples.push_back(std::move(sample));
 	}
-	std::unordered_map<int, int> cat_by_idx;
-	cat_by_idx.reserve(len);
-	for (int i = 0; i < len; i++) {
-		int idx = cats[i*2];
-		int cat_idx = cats[i*2+1];
-		cat_by_idx[idx] = cat_idx;
-	}
-	cls->SetSamples(std::move(samples), std::move(cat_by_idx));
+	cls->SetSamples(std::move(samples));
 }
 
 int facerec_classify(facerec* rec, const float* descriptor) {

@@ -61,3 +61,18 @@ void load_mem_jpeg(dlib::matrix<dlib::rgb_pixel>& img, const uint8_t* img_data, 
 	jpeg_finish_decompress(&cinfo);
 	jpeg_destroy_decompress(&cinfo);
 }
+
+void load_bytes_arr(dlib::matrix<dlib::rgb_pixel>& img, const uint8_t* img_data, int rows, int columns) {
+    img.set_size(rows, columns);
+
+    int pos = 0;
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < columns; j++) {
+            dlib::rgb_pixel p;
+            p.red = img_data[pos++];
+            p.green = img_data[pos++];
+            p.blue = img_data[pos++];
+            img(i, j) = p;
+        }
+    }
+}

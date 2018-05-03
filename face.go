@@ -2,7 +2,7 @@ package face
 
 // #cgo pkg-config: dlib-1
 // #cgo CXXFLAGS: -std=c++1z -Wall -O3 -DNDEBUG -march=native
-// #cgo LDFLAGS: -ljpeg
+// #cgo LDFLAGS: -ljpeg -lblas -llapack
 // #include <stdlib.h>
 // #include <stdint.h>
 // #include "facerec.h"
@@ -38,10 +38,12 @@ func New(r image.Rectangle, d Descriptor) Face {
 	return Face{r, d}
 }
 
-func NewRecognizer(modelDir string) (rec *Recognizer, err error) {
+func NewRecognizer(modelDir string, threshold float64, jitter uint) (rec *Recognizer, err error) {
 	cModelDir := C.CString(modelDir)
+	cThreshold := C.double(threshold)
+	cJitter := C.uint(jitter)
 	defer C.free(unsafe.Pointer(cModelDir))
-	p := C.facerec_init(cModelDir)
+	p := C.facerec_init(cModelDir, cThreshold, cJitter)
 
 	if p.err_str != nil {
 		defer C.facerec_free(p)
@@ -102,6 +104,55 @@ func (rec *Recognizer) recognize(imgData []byte, maxFaces int) (faces []Face, er
 	return
 }
 
+func (rec *Recognizer) recognizeMat(imgData []byte, rows, columns, maxFaces int) (faces []Face, err error) {
+	if len(imgData) == 0 {
+		err = ImageLoadError("Empty image")
+		return
+	}
+	cImgData := (*C.uchar)(&imgData[0])
+	cRows := C.int(rows)
+	cColumns := C.int(columns)
+	cMaxFaces := C.int(maxFaces)
+	ret := C.facerec_recognize_mat(rec.p, cImgData, cRows, cColumns, cMaxFaces)
+	defer C.free(unsafe.Pointer(ret))
+
+	if ret.err_str != nil {
+		defer C.free(unsafe.Pointer(ret.err_str))
+		err = makeError(C.GoString(ret.err_str), int(ret.err_code))
+		return
+	}
+
+	// No faces.
+	numFaces := int(ret.num_faces)
+	if numFaces == 0 {
+		return
+	}
+
+	// Copy faces data to Go structure.
+	defer C.free(unsafe.Pointer(ret.rectangles))
+	defer C.free(unsafe.Pointer(ret.descriptors))
+
+	rDataLen := numFaces * rectLen
+	rDataPtr := unsafe.Pointer(ret.rectangles)
+	rData := (*[1 << 30]C.long)(rDataPtr)[:rDataLen:rDataLen]
+
+	dDataLen := numFaces * descrLen
+	dDataPtr := unsafe.Pointer(ret.descriptors)
+	dData := (*[1 << 30]float32)(dDataPtr)[:dDataLen:dDataLen]
+
+	for i := 0; i < numFaces; i++ {
+		face := Face{}
+		x0 := int(rData[i*rectLen])
+		y0 := int(rData[i*rectLen+1])
+		x1 := int(rData[i*rectLen+2])
+		y1 := int(rData[i*rectLen+3])
+		face.Rectangle = image.Rect(x0, y0, x1, y1)
+		copy(face.Descriptor[:], dData[i*descrLen:(i+1)*descrLen])
+		faces = append(faces, face)
+	}
+	return
+}
+
 // Convenient method.
 func (rec *Recognizer) recognizeFile(imgPath string, maxFaces int) (face []Face, err error) {
 	fd, err := os.Open(imgPath)
@@ -120,6 +171,10 @@ func (rec *Recognizer) recognizeFile(imgPath string, maxFaces int) (face []Face,
 // there was some error while decoding/processing image.
 func (rec *Recognizer) Recognize(imgData []byte) (faces []Face, err error) {
 	return rec.recognize(imgData, 0)
+}
+
+func (rec *Recognizer) RecognizeMat(imgData []byte, rows, columns int) (faces []Face, err error) {
+	return rec.recognizeMat(imgData, rows, columns, 0)
 }
 
 // Recognize if image has single face or return nil otherwise.
@@ -146,14 +201,13 @@ func (rec *Recognizer) RecognizeSingleFile(imgPath string) (face *Face, err erro
 }
 
 // Set known samples for the future use.
-func (rec *Recognizer) SetSamples(samples []Descriptor, cats [][2]int32) {
-	if len(samples) == 0 || len(samples) != len(cats) {
+func (rec *Recognizer) SetSamples(samples []Descriptor) {
+	if len(samples) == 0 {
 		return
 	}
 	cSamples := (*C.float)(unsafe.Pointer(&samples[0]))
-	cCats := (*C.int32_t)(unsafe.Pointer(&cats[0]))
 	cLen := C.int(len(samples))
-	C.facerec_set_samples(rec.p, cSamples, cCats, cLen)
+	C.facerec_set_samples(rec.p, cSamples, cLen)
 }
 
 // Return class for the unknown descriptor. Negative index is returned
